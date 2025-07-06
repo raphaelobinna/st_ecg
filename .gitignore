@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Virtual environments
+venv/
+.env/
+ENV/
+env/
+.venv/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# VS Code settings
+.vscode/
+
+# macOS
+.DS_Store
+
+# WFDB generated files
+*.dat
+*.hea
+*.atr
+
+# Logs and outputs
+*.log
+*.out
+
+# Data files
+training2017/
+*.mat
+
+# NeuroKit2 cache
+neurokit2_data/
