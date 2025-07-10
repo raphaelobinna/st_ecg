@@ -5,11 +5,45 @@ import pywt
 import neurokit2 as nk
 from scipy.signal import find_peaks
 from scipy.ndimage import gaussian_filter1d
+import wfdb
+from pathlib import Path
+from packet import ImprovedWaveletPacketJPointDetector
 
 class ImprovedWaveletJPointDetector:
     def __init__(self, sampling_rate=1000):
         self.fs = sampling_rate
         self.wavelet = 'morl'  # Morlet wavelet
+
+
+    def get_record(self, data_path, record_name, selected_lead="I"):
+        file_path = Path(data_path) / record_name
+        record_name = str(file_path)
+
+        try:
+            # Load WFDB record
+            record = wfdb.rdrecord(record_name)
+
+            print(record)
+
+            # Get index of the selected lead
+            if selected_lead not in record.sig_name:
+                raise ValueError(f"Lead '{selected_lead}' not found. Available leads: {record.sig_name}")
+
+            lead_index = record.sig_name.index(selected_lead)
+            lead_signal = record.p_signal[:, lead_index]
+
+            return {
+                'signal': lead_signal,        # 1D array of selected lead
+                'lead_name': selected_lead,
+                'unit': record.units[lead_index],
+                'record': record,
+                'fs': record.fs
+            }
+
+        except Exception as e:
+            print(f"❌ Error loading ECG {record_name}: {str(e)}")
+            return None
+
         
     def _get_adaptive_scales(self, target_frequencies):
         """Get scales for specific frequency ranges"""
@@ -392,36 +426,39 @@ class ImprovedWaveletJPointDetector:
             print(f"QT Interval:     {qt_interval:.1f} ms")
 
 
-# Example usage and testing
+
 if __name__ == "__main__":
     # Generate synthetic ECG beat for testing
-    def generate_synthetic_ecg_beat(fs=1000):
-        """Generate a more realistic ECG beat"""
-        ecg = nk.data("ecg_1000hz")
-        cleaned = nk.ecg_clean(ecg, sampling_rate=fs)
-        peaks, _ = nk.ecg_peaks(cleaned, sampling_rate=fs)
-        rpeaks_idx = np.where(peaks["ECG_R_Peaks"] == 1)[0]
+    # def generate_synthetic_ecg_beat(fs=1000):
+    #     """Generate a more realistic ECG beat"""
+    #     ecg = nk.data("ecg_1000hz")
+    #     cleaned = nk.ecg_clean(ecg, sampling_rate=fs)
+    #     peaks, _ = nk.ecg_peaks(cleaned, sampling_rate=fs)
+    #     rpeaks_idx = np.where(peaks["ECG_R_Peaks"] == 1)[0]
         
-        # Segment beats
-        beats = nk.ecg_segment(cleaned, rpeaks_idx, sampling_rate=fs)
+    #     # Segment beats
+    #     beats = nk.ecg_segment(cleaned, rpeaks_idx, sampling_rate=fs)
         
-        # Get first beat
-        first_beat_df = list(beats.values())[0]
-        ecg_beat = first_beat_df["Signal"].values
+    #     # Get first beat
+    #     first_beat_df = list(beats.values())[0]
+    #     ecg_beat = first_beat_df["Signal"].values
         
-        return ecg_beat, cleaned, rpeaks_idx
+    #     return ecg_beat, cleaned, rpeaks_idx
     
     # Test the improved detector
     detector = ImprovedWaveletJPointDetector(sampling_rate=1000)
     
     # Generate test ECG beat
-    beat, full_ecg, rpeaks = generate_synthetic_ecg_beat()
+    beat = detector.get_record('./test_data','JS19400')
+    print(beat)
+
+    new_detector = ImprovedWaveletPacketJPointDetector(sampling_rate=beat['fs'])
     
     # Detect all fiducial points
-    fiducial_points = detector.detect_all_fiducial_points(beat)
+    fiducial_points = new_detector.detect_all_fiducial_points(beat['signal'])
     
-    # Print results
-    detector.print_detection_results(fiducial_points)
+    # # Print results
+    new_detector.print_detection_results(fiducial_points)
     
-    # Plot comprehensive analysis
-    detector.plot_comprehensive_analysis(beat, fiducial_points)
+    # # Plot comprehensive analysis
+    new_detector.plot_comprehensive_analysis(beat['signal'], fiducial_points)

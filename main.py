@@ -3,8 +3,9 @@ import matplotlib.pyplot as plt
 from scipy.ndimage import gaussian_filter1d
 from scipy.signal import find_peaks
 from scipy.stats import linregress
-from jpoint import WaveletJPointDetector
+from cwt import WaveletJPointDetector
 import neurokit2 as nk
+from packet import ImprovedWaveletPacketJPointDetector
 
 class EnhancedSTAnalyzer:
     def __init__(self, sampling_rate=1000):
@@ -423,8 +424,8 @@ def run_st_analysis_example():
     """Run example ST analysis"""
 
     
-    # Create detector and analyzer
-    detector = WaveletJPointDetector(sampling_rate=1000)
+    # detector and analyzer
+    detector = ImprovedWaveletPacketJPointDetector(sampling_rate=1000)
     analyzer = EnhancedSTAnalyzer(sampling_rate=1000)
     analyzer.set_j_detector(detector)
     
