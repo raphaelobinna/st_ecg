@@ -7,13 +7,11 @@ from scipy.signal import find_peaks
 from scipy.ndimage import gaussian_filter1d
 import wfdb
 from pathlib import Path
-from packet import ImprovedWaveletPacketJPointDetector
 
 class ImprovedWaveletJPointDetector:
     def __init__(self, sampling_rate=1000):
         self.fs = sampling_rate
         self.wavelet = 'morl'  # Morlet wavelet
-
 
     def get_record(self, data_path, record_name, selected_lead="I"):
         file_path = Path(data_path) / record_name
@@ -21,21 +19,15 @@ class ImprovedWaveletJPointDetector:
 
         try:
             # Load WFDB record
-            record = wfdb.rdrecord(record_name)
-
+            record = wfdb.rdrecord(record_name, channels=[0])
             print(record)
-
-            # Get index of the selected lead
-            if selected_lead not in record.sig_name:
-                raise ValueError(f"Lead '{selected_lead}' not found. Available leads: {record.sig_name}")
-
-            lead_index = record.sig_name.index(selected_lead)
-            lead_signal = record.p_signal[:, lead_index]
+            
+            lead_signal = record.p_signal[:, 0]
 
             return {
                 'signal': lead_signal,        # 1D array of selected lead
                 'lead_name': selected_lead,
-                'unit': record.units[lead_index],
+                'unit': record.units[0],
                 'record': record,
                 'fs': record.fs
             }
@@ -44,7 +36,48 @@ class ImprovedWaveletJPointDetector:
             print(f"❌ Error loading ECG {record_name}: {str(e)}")
             return None
 
+    def detect_all_qrs_complexes(self, signal_data):
+        """Detect all QRS complexes in the full ECG signal"""
+        # Clean the signal first
+        cleaned_signal = nk.ecg_clean(signal_data, sampling_rate=self.fs)
         
+        # Detect R peaks using NeuroKit2
+        peaks, info = nk.ecg_peaks(cleaned_signal, sampling_rate=self.fs)
+        r_peaks = np.where(peaks["ECG_R_Peaks"] == 1)[0]
+        
+        print(f"Detected {len(r_peaks)} QRS complexes")
+        
+        return r_peaks, cleaned_signal
+
+    def segment_beats(self, signal_data, r_peaks, before_samples=None, after_samples=None):
+        """Segment ECG into individual beats around R peaks"""
+        if before_samples is None:
+            before_samples = int(0.3 * self.fs)  # 300ms before R peak
+        if after_samples is None:
+            after_samples = int(0.4 * self.fs)   # 400ms after R peak
+            
+        beats = []
+        valid_r_peaks = []
+        
+        for i, r_peak in enumerate(r_peaks):
+            start_idx = r_peak - before_samples
+            end_idx = r_peak + after_samples
+            
+            # Check if segment is within signal bounds
+            if start_idx >= 0 and end_idx < len(signal_data):
+                beat = signal_data[start_idx:end_idx]
+                beats.append({
+                    'signal': beat,
+                    'r_peak_global': r_peak,
+                    'r_peak_local': before_samples,  # R peak position in local beat
+                    'start_idx': start_idx,
+                    'end_idx': end_idx,
+                    'beat_number': i
+                })
+                valid_r_peaks.append(r_peak)
+        
+        return beats, valid_r_peaks
+
     def _get_adaptive_scales(self, target_frequencies):
         """Get scales for specific frequency ranges"""
         scales = pywt.frequency2scale(self.wavelet, target_frequencies / self.fs)
@@ -60,18 +93,22 @@ class ImprovedWaveletJPointDetector:
         frequencies = central_freq / (scales * (1/self.fs))
         
         return coefficients, frequencies, scales
-    
-    def detect_r_peak(self, beat):
+
+    def detect_r_peak(self, beat, initial_r_peak=None):
         """Improved R peak detection using wavelet analysis"""
-        # R wave has dominant frequency around 10-40 Hz
-        qrs_frequencies = np.arange(10, 45, 2)
-        coeffs, freqs, scales = self.continuous_wavelet_transform(beat, qrs_frequencies)
-        
-        # Sum energy across QRS frequency range
-        qrs_energy = np.sum(np.abs(coeffs), axis=0)
-        
-        # Find the maximum energy point (R peak)
-        r_peak_idx = np.argmax(qrs_energy)
+        if initial_r_peak is not None:
+            # Use the provided R peak location and refine it
+            r_peak_idx = initial_r_peak
+        else:
+            # R wave has dominant frequency around 10-40 Hz
+            qrs_frequencies = np.arange(10, 45, 2)
+            coeffs, freqs, scales = self.continuous_wavelet_transform(beat, qrs_frequencies)
+            
+            # Sum energy across QRS frequency range
+            qrs_energy = np.sum(np.abs(coeffs), axis=0)
+            
+            # Find the maximum energy point (R peak)
+            r_peak_idx = np.argmax(qrs_energy)
         
         # Refine using local maximum in original signal
         search_window = int(0.02 * self.fs)  # 20ms window
@@ -82,8 +119,8 @@ class ImprovedWaveletJPointDetector:
         local_max_idx = np.argmax(local_segment)
         r_peak_refined = start_search + local_max_idx
         
-        return r_peak_refined, qrs_energy
-    
+        return r_peak_refined
+
     def detect_qrs_boundaries(self, beat, r_peak_idx):
         """Detect QRS onset and offset using wavelet analysis"""
         # QRS complex frequency content
@@ -102,7 +139,7 @@ class ImprovedWaveletJPointDetector:
             qrs_energy_smooth, r_peak_idx)
         
         return qrs_onset, qrs_offset, qrs_energy_smooth
-    
+
     def _find_qrs_boundaries_adaptive(self, energy, r_peak_idx):
         """Find QRS boundaries using adaptive thresholding"""
         # Define realistic search windows
@@ -131,7 +168,7 @@ class ImprovedWaveletJPointDetector:
                 break
                 
         return qrs_onset, qrs_offset
-    
+
     def detect_p_wave(self, beat, qrs_onset):
         """Detect P wave using low-frequency wavelet analysis"""
         # P wave has lower frequency content (1-8 Hz)
@@ -142,14 +179,13 @@ class ImprovedWaveletJPointDetector:
         p_search_end = max(0, qrs_onset - int(0.02 * self.fs))    # 20ms before QRS
         
         if p_search_start >= p_search_end:
-            return p_search_start  # Return default if no valid search region
+            return p_search_start
         
         p_region = beat[p_search_start:p_search_end]
         
-        if len(p_region) < 10:  # Not enough data
+        if len(p_region) < 10:
             return p_search_start
         
-        # Apply wavelet transform to P wave region
         try:
             coeffs, freqs, scales = self.continuous_wavelet_transform(p_region, p_frequencies)
             p_energy = np.sum(np.abs(coeffs), axis=0)
@@ -169,7 +205,7 @@ class ImprovedWaveletJPointDetector:
             p_peak_idx = p_search_start
             
         return p_peak_idx
-    
+
     def detect_t_wave(self, beat, j_point):
         """Detect T wave using appropriate frequency analysis"""
         # T wave has frequency content around 1-8 Hz
@@ -180,14 +216,13 @@ class ImprovedWaveletJPointDetector:
         t_search_end = min(len(beat), j_point + int(0.35 * self.fs))        # 350ms after J
         
         if t_search_start >= t_search_end or t_search_start >= len(beat):
-            return min(len(beat) - 1, j_point + int(0.15 * self.fs))  # Default fallback
+            return min(len(beat) - 1, j_point + int(0.15 * self.fs))
         
         t_region = beat[t_search_start:t_search_end]
         
-        if len(t_region) < 10:  # Not enough data
+        if len(t_region) < 10:
             return min(len(beat) - 1, j_point + int(0.15 * self.fs))
         
-        # Apply wavelet transform to T wave region
         try:
             coeffs, freqs, scales = self.continuous_wavelet_transform(t_region, t_frequencies)
             t_energy = np.sum(np.abs(coeffs), axis=0)
@@ -207,7 +242,7 @@ class ImprovedWaveletJPointDetector:
             t_peak_idx = t_search_start
             
         return t_peak_idx
-    
+
     def refine_j_point_with_derivatives(self, beat, initial_qrs_offset):
         """Refine J-point using derivative analysis"""
         # Calculate derivatives
@@ -231,11 +266,14 @@ class ImprovedWaveletJPointDetector:
                         best_j_point = i
         
         return best_j_point
-    
-    def detect_all_fiducial_points(self, beat):
-        """Detect all fiducial points with improved accuracy"""
-        # Step 1: Detect R peak first
-        r_peak_idx, qrs_energy = self.detect_r_peak(beat)
+
+    def detect_all_fiducial_points(self, beat_info):
+        """Detect all fiducial points for a single beat"""
+        beat = beat_info['signal']
+        r_peak_local = beat_info['r_peak_local']
+        
+        # Step 1: Use known R peak location
+        r_peak_idx = self.detect_r_peak(beat, r_peak_local)
         
         # Step 2: Detect QRS boundaries
         qrs_onset, qrs_offset, qrs_energy_smooth = self.detect_qrs_boundaries(beat, r_peak_idx)
@@ -257,17 +295,18 @@ class ImprovedWaveletJPointDetector:
             'j_point': j_point,
             'qrs_offset': qrs_offset,
             't_peak': t_peak,
-            'qrs_energy': qrs_energy_smooth
+            'qrs_energy': qrs_energy_smooth,
+            'beat_number': beat_info['beat_number'],
+            'start_idx': beat_info['start_idx']
         })
         
         return fiducial_points
-    
+
     def _validate_all_points(self, beat, points):
         """Validate all fiducial points for physiological consistency"""
         validated = points.copy()
         
         # Ensure proper ordering: P < QRS_onset < R < J < QRS_offset < T
-        # And reasonable timing intervals
         
         # P wave should be before QRS onset
         if validated['p_peak'] >= validated['qrs_onset']:
@@ -291,174 +330,280 @@ class ImprovedWaveletJPointDetector:
         
         # Ensure all indices are within bounds
         for key in validated:
-            if key != 'qrs_energy':
+            if key not in ['qrs_energy', 'beat_number', 'start_idx']:
                 validated[key] = max(0, min(len(beat) - 1, validated[key]))
         
         return validated
-    
-    def plot_comprehensive_analysis(self, beat, fiducial_points):
-        """Plot comprehensive analysis with improved visualization"""
+
+    def process_full_ecg(self, ecg_data):
+        """Process the full ECG signal and detect fiducial points for all beats"""
+        # Step 1: Detect all QRS complexes
+        r_peaks, cleaned_signal = self.detect_all_qrs_complexes(ecg_data)
         
-        fig, axes = plt.subplots(5, 1, figsize=(16, 14))
+        # Step 2: Segment into individual beats
+        beats, valid_r_peaks = self.segment_beats(cleaned_signal, r_peaks)
         
-        # Plot 1: ECG with all fiducial points
-        axes[0].plot(beat, 'b-', linewidth=2, label='ECG Beat')
+        # Step 3: Detect fiducial points for each beat
+        all_fiducial_points = []
         
-        # Mark fiducial points with better visibility
-        points_info = {
-            'p_peak': ('P Peak', 'green', 'o'),
-            'qrs_onset': ('QRS Onset', 'orange', 's'),
-            'r_peak': ('R Peak', 'red', '^'),
-            'j_point': ('J Point', 'purple', 'D'),
-            'qrs_offset': ('QRS Offset', 'brown', 'v'),
-            't_peak': ('T Peak', 'cyan', 'o')
+        print(f"Processing {len(beats)} beats...")
+        for i, beat_info in enumerate(beats):
+            try:
+                fiducial_points = self.detect_all_fiducial_points(beat_info)
+                all_fiducial_points.append(fiducial_points)
+                if (i + 1) % 10 == 0:
+                    print(f"Processed {i + 1}/{len(beats)} beats")
+            except Exception as e:
+                print(f"Error processing beat {i}: {e}")
+                continue
+        
+        return all_fiducial_points, cleaned_signal, valid_r_peaks
+
+    def plot_full_ecg_with_fiducial_points(self, signal_data, all_fiducial_points, title="ECG with All Fiducial Points"):
+        """Plot the full ECG signal with all detected fiducial points"""
+        
+        fig, ax = plt.subplots(1, 1, figsize=(20, 8))
+        
+        # Plot ECG signal
+        time_axis = np.arange(len(signal_data)) / self.fs
+        ax.plot(time_axis, signal_data, 'b-', linewidth=1.5, label='ECG Signal', alpha=0.8)
+        
+        # Define colors and markers for different fiducial points
+        colors = {
+            'p_peak': 'green',
+            'qrs_onset': 'orange', 
+            'r_peak': 'red',
+            'j_point': 'purple',
+            'qrs_offset': 'brown',
+            't_peak': 'cyan'
         }
         
-        for point, (label, color, marker) in points_info.items():
-            idx = fiducial_points[point]
-            if 0 <= idx < len(beat):
-                axes[0].scatter(idx, beat[idx], color=color, s=120, 
-                              marker=marker, label=label, zorder=5, edgecolor='black')
+        markers = {
+            'p_peak': 'o',
+            'qrs_onset': 's',
+            'r_peak': '^',
+            'j_point': 'D',
+            'qrs_offset': 'v',
+            't_peak': 'o'
+        }
         
-        axes[0].set_title('ECG Beat with Improved Wavelet-Based Fiducial Point Detection', fontsize=14)
-        axes[0].set_ylabel('Amplitude (mV)')
-        axes[0].legend(loc='upper right')
-        axes[0].grid(True, alpha=0.3)
+        labels = {
+            'p_peak': 'P Peak',
+            'qrs_onset': 'QRS Onset',
+            'r_peak': 'R Peak',
+            'j_point': 'J Point',
+            'qrs_offset': 'QRS Offset',
+            't_peak': 'T Peak'
+        }
         
-        # Plot 2: R peak detection (QRS frequencies)
-        qrs_frequencies = np.arange(10, 45, 2)
-        coeffs_qrs, freqs_qrs, _ = self.continuous_wavelet_transform(beat, qrs_frequencies)
-        im1 = axes[1].imshow(np.abs(coeffs_qrs), aspect='auto', cmap='jet', 
-                           extent=[0, len(beat), freqs_qrs[-1], freqs_qrs[0]])
-        axes[1].axvline(x=fiducial_points['r_peak'], color='white', linestyle='--', 
-                       linewidth=2, label='R Peak')
-        axes[1].set_title('QRS Frequency Analysis (10-45 Hz)', fontsize=12)
-        axes[1].set_ylabel('Frequency (Hz)')
-        axes[1].legend()
-        plt.colorbar(im1, ax=axes[1], label='Magnitude')
+        # Plot fiducial points for all beats
+        for point_type in ['p_peak', 'qrs_onset', 'r_peak', 'j_point', 'qrs_offset', 't_peak']:
+            x_coords = []
+            y_coords = []
+            
+            for fiducial_points in all_fiducial_points:
+                if point_type in fiducial_points:
+                    # Convert local beat index to global signal index
+                    global_idx = fiducial_points['start_idx'] + fiducial_points[point_type]
+                    
+                    if 0 <= global_idx < len(signal_data):
+                        x_coords.append(global_idx / self.fs)
+                        y_coords.append(signal_data[global_idx])
+            
+            if x_coords:
+                ax.scatter(x_coords, y_coords, 
+                          color=colors[point_type], 
+                          marker=markers[point_type],
+                          s=60, 
+                          label=labels[point_type],
+                          zorder=5,
+                          edgecolor='black',
+                          linewidth=0.5)
         
-        # Plot 3: P wave analysis (low frequencies)
-        p_frequencies = np.arange(1, 12, 1)
-        try:
-            coeffs_p, freqs_p, _ = self.continuous_wavelet_transform(beat, p_frequencies)
-            im2 = axes[2].imshow(np.abs(coeffs_p), aspect='auto', cmap='viridis', 
-                               extent=[0, len(beat), freqs_p[-1], freqs_p[0]])
-            axes[2].axvline(x=fiducial_points['p_peak'], color='white', linestyle='--', 
-                           linewidth=2, label='P Peak')
-            axes[2].set_title('P Wave Analysis (1-12 Hz)', fontsize=12)
-            axes[2].set_ylabel('Frequency (Hz)')
-            axes[2].legend()
-            plt.colorbar(im2, ax=axes[2], label='Magnitude')
-        except Exception as e:
-            axes[2].text(0.5, 0.5, f'P wave analysis failed: {str(e)}', 
-                        transform=axes[2].transAxes, ha='center', va='center')
+        ax.set_xlabel('Time (s)', fontsize=12)
+        ax.set_ylabel('Amplitude (mV)', fontsize=12)
+        ax.set_title(title, fontsize=14)
+        ax.legend(loc='upper right', fontsize=10)
+        ax.grid(True, alpha=0.3)
         
-        # Plot 4: T wave analysis (low frequencies)
-        t_frequencies = np.arange(1, 10, 1)
-        try:
-            coeffs_t, freqs_t, _ = self.continuous_wavelet_transform(beat, t_frequencies)
-            im3 = axes[3].imshow(np.abs(coeffs_t), aspect='auto', cmap='plasma', 
-                               extent=[0, len(beat), freqs_t[-1], freqs_t[0]])
-            axes[3].axvline(x=fiducial_points['t_peak'], color='white', linestyle='--', 
-                           linewidth=2, label='T Peak')
-            axes[3].set_title('T Wave Analysis (1-10 Hz)', fontsize=12)
-            axes[3].set_ylabel('Frequency (Hz)')
-            axes[3].legend()
-            plt.colorbar(im3, ax=axes[3], label='Magnitude')
-        except Exception as e:
-            axes[3].text(0.5, 0.5, f'T wave analysis failed: {str(e)}', 
-                        transform=axes[3].transAxes, ha='center', va='center')
+        # Add some statistics
+        stats_text = f"Total Beats: {len(all_fiducial_points)}\n"
+        stats_text += f"Sampling Rate: {self.fs} Hz\n"
+        stats_text += f"Duration: {len(signal_data)/self.fs:.1f} s"
         
-        # Plot 5: Energy signals for all components
-        if 'qrs_energy' in fiducial_points:
-            axes[4].plot(fiducial_points['qrs_energy'], 'r-', linewidth=2, alpha=0.7, label='QRS Energy')
-        
-        # Mark all fiducial points
-        for point, (label, color, marker) in points_info.items():
-            idx = fiducial_points[point]
-            axes[4].axvline(x=idx, color=color, linestyle='--', alpha=0.7, label=label)
-        
-        axes[4].set_title('Wavelet Energy Signals and Fiducial Points', fontsize=12)
-        axes[4].set_ylabel('Energy')
-        axes[4].set_xlabel('Sample')
-        axes[4].legend()
-        axes[4].grid(True, alpha=0.3)
+        ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, 
+                verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
         
         plt.tight_layout()
         plt.show()
         
         return fig
-    
-    def print_detection_results(self, fiducial_points):
-        """Print detailed detection results"""
-        print("=== Improved Wavelet-Based Fiducial Point Detection Results ===")
-        print(f"Sampling Rate: {self.fs} Hz")
-        print(f"Wavelet Used: {self.wavelet}")
-        print()
+
+    def plot_selected_beats(self, signal_data, all_fiducial_points, beat_indices=None, max_beats=6):
+        """Plot selected individual beats with their fiducial points"""
         
-        point_names = {
-            'p_peak': 'P Wave Peak',
-            'qrs_onset': 'QRS Onset',
-            'r_peak': 'R Peak',
-            'j_point': 'J Point',
-            'qrs_offset': 'QRS Offset',
-            't_peak': 'T Wave Peak'
+        if beat_indices is None:
+            # Select evenly spaced beats
+            total_beats = len(all_fiducial_points)
+            if total_beats > max_beats:
+                beat_indices = np.linspace(0, total_beats-1, max_beats, dtype=int)
+            else:
+                beat_indices = list(range(total_beats))
+        
+        n_beats = len(beat_indices)
+        fig, axes = plt.subplots(n_beats, 1, figsize=(12, 3*n_beats))
+        
+        if n_beats == 1:
+            axes = [axes]
+        
+        colors = {
+            'p_peak': 'green',
+            'qrs_onset': 'orange', 
+            'r_peak': 'red',
+            'j_point': 'purple',
+            'qrs_offset': 'brown',
+            't_peak': 'cyan'
         }
         
-        for point, name in point_names.items():
-            if point in fiducial_points:
-                idx = fiducial_points[point]
-                time_ms = (idx / self.fs) * 1000
-                print(f"{name:15}: Sample {idx:4d}, Time: {time_ms:6.1f} ms")
+        markers = {
+            'p_peak': 'o',
+            'qrs_onset': 's',
+            'r_peak': '^',
+            'j_point': 'D',
+            'qrs_offset': 'v',
+            't_peak': 'o'
+        }
         
-        # Calculate intervals
-        print("\n=== Calculated Intervals ===")
-        if all(p in fiducial_points for p in ['p_peak', 'qrs_onset']):
-            pr_interval = (fiducial_points['qrs_onset'] - fiducial_points['p_peak']) / self.fs * 1000
-            print(f"PR Interval:     {pr_interval:.1f} ms")
+        for i, beat_idx in enumerate(beat_indices):
+            fiducial_points = all_fiducial_points[beat_idx]
+            start_idx = fiducial_points['start_idx']
+            
+            # Extract beat segment
+            beat_length = int(0.7 * self.fs)  # 700ms beat
+            end_idx = start_idx + beat_length
+            
+            if end_idx <= len(signal_data):
+                beat_signal = signal_data[start_idx:end_idx]
+                time_axis = np.arange(len(beat_signal)) / self.fs * 1000  # Convert to ms
+                
+                # Plot beat
+                axes[i].plot(time_axis, beat_signal, 'b-', linewidth=2, alpha=0.8)
+                
+                # Plot fiducial points
+                for point_type in ['p_peak', 'qrs_onset', 'r_peak', 'j_point', 'qrs_offset', 't_peak']:
+                    if point_type in fiducial_points:
+                        local_idx = fiducial_points[point_type]
+                        if 0 <= local_idx < len(beat_signal):
+                            time_point = local_idx / self.fs * 1000
+                            axes[i].scatter(time_point, beat_signal[local_idx],
+                                          color=colors[point_type],
+                                          marker=markers[point_type],
+                                          s=80, zorder=5,
+                                          edgecolor='black',
+                                          linewidth=0.5)
+                
+                axes[i].set_title(f'Beat {beat_idx + 1}', fontsize=12)
+                axes[i].set_ylabel('Amplitude (mV)', fontsize=10)
+                axes[i].grid(True, alpha=0.3)
+                
+                if i == len(beat_indices) - 1:
+                    axes[i].set_xlabel('Time (ms)', fontsize=10)
         
-        if all(p in fiducial_points for p in ['qrs_onset', 'qrs_offset']):
-            qrs_duration = (fiducial_points['qrs_offset'] - fiducial_points['qrs_onset']) / self.fs * 1000
-            print(f"QRS Duration:    {qrs_duration:.1f} ms")
+        plt.tight_layout()
+        plt.show()
         
-        if all(p in fiducial_points for p in ['qrs_onset', 't_peak']):
-            qt_interval = (fiducial_points['t_peak'] - fiducial_points['qrs_onset']) / self.fs * 1000
-            print(f"QT Interval:     {qt_interval:.1f} ms")
+        return fig
+
+    def print_summary_statistics(self, all_fiducial_points):
+        """Print summary statistics for all detected fiducial points"""
+        print("\n" + "="*60)
+        print("SUMMARY STATISTICS FOR ALL BEATS")
+        print("="*60)
+        
+        print(f"Total number of beats processed: {len(all_fiducial_points)}")
+        print(f"Sampling rate: {self.fs} Hz")
+        print(f"Wavelet used: {self.wavelet}")
+        
+        # Calculate interval statistics
+        intervals = {
+            'PR': [],
+            'QRS': [],
+            'QT': [],
+            'RR': []
+        }
+        
+        prev_r_peak = None
+        
+        for fiducial_points in all_fiducial_points:
+            # PR interval
+            if 'p_peak' in fiducial_points and 'qrs_onset' in fiducial_points:
+                pr_ms = (fiducial_points['qrs_onset'] - fiducial_points['p_peak']) / self.fs * 1000
+                if 50 <= pr_ms <= 300:  # Physiological range
+                    intervals['PR'].append(pr_ms)
+            
+            # QRS duration
+            if 'qrs_onset' in fiducial_points and 'qrs_offset' in fiducial_points:
+                qrs_ms = (fiducial_points['qrs_offset'] - fiducial_points['qrs_onset']) / self.fs * 1000
+                if 60 <= qrs_ms <= 200:  # Physiological range
+                    intervals['QRS'].append(qrs_ms)
+            
+            # QT interval
+            if 'qrs_onset' in fiducial_points and 't_peak' in fiducial_points:
+                qt_ms = (fiducial_points['t_peak'] - fiducial_points['qrs_onset']) / self.fs * 1000
+                if 200 <= qt_ms <= 500:  # Physiological range
+                    intervals['QT'].append(qt_ms)
+            
+            # RR interval
+            current_r_peak = fiducial_points['start_idx'] + fiducial_points['r_peak']
+            if prev_r_peak is not None:
+                rr_ms = (current_r_peak - prev_r_peak) / self.fs * 1000
+                if 400 <= rr_ms <= 2000:  # Physiological range
+                    intervals['RR'].append(rr_ms)
+            prev_r_peak = current_r_peak
+        
+        print("\nInterval Statistics (mean ± std):")
+        print("-" * 40)
+        
+        for interval_name, values in intervals.items():
+            if values:
+                mean_val = np.mean(values)
+                std_val = np.std(values)
+                print(f"{interval_name:3} interval: {mean_val:6.1f} ± {std_val:5.1f} ms (n={len(values)})")
+            else:
+                print(f"{interval_name:3} interval: No valid measurements")
+        
+        # Heart rate calculation
+        if intervals['RR']:
+            heart_rate = 60000 / np.mean(intervals['RR'])  # Convert from ms to bpm
+            print(f"\nAverage Heart Rate: {heart_rate:.1f} bpm")
+        
+        print("="*60)
 
 
-
+# Example usage
 if __name__ == "__main__":
-    # Generate synthetic ECG beat for testing
-    # def generate_synthetic_ecg_beat(fs=1000):
-    #     """Generate a more realistic ECG beat"""
-    #     ecg = nk.data("ecg_1000hz")
-    #     cleaned = nk.ecg_clean(ecg, sampling_rate=fs)
-    #     peaks, _ = nk.ecg_peaks(cleaned, sampling_rate=fs)
-    #     rpeaks_idx = np.where(peaks["ECG_R_Peaks"] == 1)[0]
-        
-    #     # Segment beats
-    #     beats = nk.ecg_segment(cleaned, rpeaks_idx, sampling_rate=fs)
-        
-    #     # Get first beat
-    #     first_beat_df = list(beats.values())[0]
-    #     ecg_beat = first_beat_df["Signal"].values
-        
-    #     return ecg_beat, cleaned, rpeaks_idx
-    
     # Test the improved detector
     detector = ImprovedWaveletJPointDetector(sampling_rate=1000)
     
-    # Generate test ECG beat
-    beat = detector.get_record('./test_data','JS19400')
-    print(beat)
+    # Load ECG record
+    ecg_data = detector.get_record('./output_folder', 'test_record')
+    
+    if ecg_data is not None:
+        # Update detector with actual sampling rate
+        detector.fs = ecg_data['fs']
+        
+        # Process the full ECG signal
+        all_fiducial_points, cleaned_signal, r_peaks = detector.process_full_ecg(ecg_data['signal'])
+        
+        # Plot results
+        detector.plot_full_ecg_with_fiducial_points(cleaned_signal, all_fiducial_points)
+        
+        # Plot selected individual beats
+        detector.plot_selected_beats(cleaned_signal, all_fiducial_points, max_beats=4)
+        
+        # Print summary statistics
+        detector.print_summary_statistics(all_fiducial_points)
+    else:
+        print("Failed to load ECG data")
 
-    new_detector = ImprovedWaveletPacketJPointDetector(sampling_rate=beat['fs'])
-    
-    # Detect all fiducial points
-    fiducial_points = new_detector.detect_all_fiducial_points(beat['signal'])
-    
-    # # Print results
-    new_detector.print_detection_results(fiducial_points)
-    
-    # # Plot comprehensive analysis
-    new_detector.plot_comprehensive_analysis(beat['signal'], fiducial_points)
+        
